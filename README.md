@@ -3,8 +3,7 @@ title: FlightSim
 emoji: ✈️
 colorFrom: blue
 colorTo: indigo
-sdk: gradio
-sdk_version: 5.0.0
+sdk: docker
 app_file: examples/gradio_demo.py
 pinned: false
 license: mit
