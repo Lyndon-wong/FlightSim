@@ -80,7 +80,7 @@ class StandardAutopilot(BaseAutopilot):
     实现完整的民航飞行程序，包括五边进近
     """
     
-    def __init__(self, model: SixDOFModel, cruise_speed_mach: Optional[float] = None):
+    def __init__(self, model: SixDOFModel, cruise_speed_mach: Optional[float] = None, cruise_alt_ft: Optional[float] = None):
         super().__init__(model)
         
         # 航路点
@@ -95,6 +95,10 @@ class StandardAutopilot(BaseAutopilot):
         # 巡航参数（从飞机性能数据获取，可配置）
         perf = model.params.performance
         self.cruise_alt_m = perf.cruise_alt_ft * 0.3048  # 转换为米
+        # 如果指定了巡航高度，使用指定值
+        if cruise_alt_ft is not None:
+            self.cruise_alt_m = cruise_alt_ft * 0.3048
+
         # 使用指定的巡航速度或默认最优速度
         actual_cruise_mach = cruise_speed_mach if cruise_speed_mach else perf.cruise_speed_mach
         self.cruise_speed_ms = actual_cruise_mach * 340 * 0.85  # 近似巡航速度
@@ -175,8 +179,8 @@ class StandardAutopilot(BaseAutopilot):
             )
             
             # 根据航程调整巡航高度
-            perf = self.model.params.performance
-            original_cruise_alt_m = perf.cruise_alt_ft * 0.3048
+            # 使用当前设定的巡航高度作为基准
+            original_cruise_alt_m = self.cruise_alt_m
             
             # 短程航线特殊处理
             if self.total_route_distance < 300000:  # < 300km
@@ -1132,7 +1136,8 @@ class LongHaulAutopilot(StandardAutopilot):
 
 def create_autopilot(model: SixDOFModel, 
                      range_category: str = None,
-                     cruise_speed_mach: Optional[float] = None) -> BaseAutopilot:
+                     cruise_speed_mach: Optional[float] = None,
+                     cruise_alt_ft: Optional[float] = None) -> BaseAutopilot:
     """
     根据航程分类创建合适的自动驾驶实例
     
@@ -1141,6 +1146,7 @@ def create_autopilot(model: SixDOFModel,
         range_category: 航程分类 ('SHORT_HAUL', 'MEDIUM_HAUL', 'LONG_HAUL')
                        如果为None，自动从模型推断
         cruise_speed_mach: 可选的巡航马赫数
+        cruise_alt_ft: 可选的巡航高度（英尺）
     
     Returns:
         合适的自动驾驶实例
@@ -1157,9 +1163,9 @@ def create_autopilot(model: SixDOFModel,
     
     # 根据分类创建实例
     if range_category == 'SHORT_HAUL':
-        return ShortHaulAutopilot(model, cruise_speed_mach)
+        return ShortHaulAutopilot(model, cruise_speed_mach, cruise_alt_ft)
     elif range_category == 'LONG_HAUL':
-        return LongHaulAutopilot(model, cruise_speed_mach)
+        return LongHaulAutopilot(model, cruise_speed_mach, cruise_alt_ft)
     else:  # MEDIUM_HAUL or default
-        return MediumHaulAutopilot(model, cruise_speed_mach)
+        return MediumHaulAutopilot(model, cruise_speed_mach, cruise_alt_ft)
 

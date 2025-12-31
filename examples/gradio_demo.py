@@ -39,7 +39,8 @@ aircraft_options = aircraft_df['aircraft_type'].tolist()
 
 
 def generate_trajectory(aircraft_type: str, route_data: pd.Series, 
-                        cruise_speed_mach: float = None, dt: float = 2.0, max_time: float = None):
+                        cruise_speed_mach: float = None, cruise_alt_ft: float = None, 
+                        dt: float = 2.0, max_time: float = None):
     """
     使用六自由度模型生成完整飞行轨迹
     
@@ -47,6 +48,7 @@ def generate_trajectory(aircraft_type: str, route_data: pd.Series,
         aircraft_type: 飞机型号
         route_data: 航线数据
         cruise_speed_mach: 巡航马赫数（可选，使用默认最优速度时为None）
+        cruise_alt_ft: 巡航高度（英尺）（可选，使用默认高度时为None）
         dt: 时间步长（秒）
         max_time: 最大仿真时间（秒）
     
@@ -88,7 +90,7 @@ def generate_trajectory(aircraft_type: str, route_data: pd.Series,
     range_category = ac_info.get('range_category', None)
     
     # 使用工厂函数创建合适的自动驾驶
-    autopilot = create_autopilot(model, range_category, cruise_speed_mach)
+    autopilot = create_autopilot(model, range_category, cruise_speed_mach, cruise_alt_ft)
     autopilot.load_route(waypoints, runway_heading=runway_heading)
     autopilot.phase = FlightPhase.TAXI
     model.set_config(flaps_idx=1, gear_down=True)
@@ -528,6 +530,22 @@ def get_speed_range(aircraft_type: str):
     return float(mach_min), float(mach_max), float(mach_opt)
 
 
+def get_altitude_range(aircraft_type: str):
+    """获取机型的巡航高度范围，返回(min, max, recommended)"""
+    if not aircraft_type:
+        return 10000, 45000, 35000
+    
+    ac = aircraft_df[aircraft_df['aircraft_type'] == aircraft_type].iloc[0]
+    # 使用Service Ceiling作为最大高度
+    alt_max = ac.get('service_ceiling_ft', 41000)
+    # 推荐高度
+    alt_rec = ac.get('cruise_alt_ft', 35000)
+    # 最小高度定义为10000英尺或推荐高度的60%
+    alt_min = 10000
+    
+    return float(alt_min), float(alt_max), float(alt_rec)
+
+
 def update_speed_slider(aircraft_type: str):
     """更新巡航速度滑动条的范围"""
     mach_min, mach_max, mach_opt = get_speed_range(aircraft_type)
@@ -541,10 +559,16 @@ def update_speed_slider(aircraft_type: str):
     return gr.update(minimum=mach_min, maximum=mach_max, value=mach_opt, label=f"🚀 巡航马赫数 ({mach_min:.2f} - {mach_max:.2f})"), info
 
 
-def run_simulation(route_name: str, aircraft_type: str, cruise_mach: float, progress=gr.Progress()):
+def update_altitude_slider(aircraft_type: str):
+    """更新巡航高度滑动条的范围"""
+    alt_min, alt_max, alt_rec = get_altitude_range(aircraft_type)
+    return gr.update(minimum=alt_min, maximum=alt_max, value=alt_rec, label=f"🏔️ 巡航高度 ({alt_min:.0f} - {alt_max:.0f} ft)")
+
+
+def run_simulation(route_name: str, aircraft_type: str, cruise_mach: float, cruise_alt: float, progress=gr.Progress()):
     """运行模拟并返回可视化结果"""
     if not route_name or not aircraft_type:
-        return None, None, "⚠️ 请选择航线和机型"
+        return None, None, None, None, None, "⚠️ 请选择航线和机型", None
     
     # 解析航线索引
     route_idx = route_options.index(route_name)
@@ -554,7 +578,9 @@ def run_simulation(route_name: str, aircraft_type: str, cruise_mach: float, prog
     
     # 生成轨迹（使用指定的巡航速度）
     progress(0.2, desc="正在生成飞行轨迹...")
-    trajectory_df = generate_trajectory(aircraft_type, route, cruise_speed_mach=cruise_mach)
+    trajectory_df = generate_trajectory(aircraft_type, route, 
+                                      cruise_speed_mach=cruise_mach,
+                                      cruise_alt_ft=cruise_alt)
     
     progress(0.6, desc="正在生成可视化...")
     
@@ -586,6 +612,15 @@ def run_simulation(route_name: str, aircraft_type: str, cruise_mach: float, prog
         speed_note = "📉 经济巡航（较省油）"
     else:
         speed_note = "📈 高速巡航（较耗油）"
+
+    # 判断高度偏离建议值的程度
+    rec_alt = aircraft['cruise_alt_ft']
+    if abs(cruise_alt - rec_alt) < 500:
+        alt_note = "✅ 建议高度"
+    elif cruise_alt > rec_alt + 2000:
+        alt_note = "☁️ 较高高度"
+    else:
+        alt_note = "📉 较低高度"
     
     stats = f"""
 ## 📊 飞行统计
@@ -595,7 +630,7 @@ def run_simulation(route_name: str, aircraft_type: str, cruise_mach: float, prog
 | **航线距离** | {route['distance_km']:.0f} km |
 | **飞行时间** | {total_time/60:.1f} 分钟 |
 | **最大高度** | {max_alt:.0f} m ({max_alt*3.28084:.0f} ft) |
-| **巡航高度** | {aircraft['cruise_alt_ft']:.0f} ft |
+| **设定巡航高度** | {cruise_alt:.0f} ft ({alt_note}) |
 | **巡航马赫数** | {cruise_mach:.3f} ({speed_note}) |
 | **最大速度** | {max_speed:.1f} m/s ({max_speed*1.944:.0f} 节) |
 | **燃油消耗** | {fuel_used:.0f} kg |
@@ -605,11 +640,17 @@ def run_simulation(route_name: str, aircraft_type: str, cruise_mach: float, prog
 - **制造商**: {aircraft['manufacturer']}
 - **最大起飞重量**: {aircraft['mtow_kg']:,.0f} kg
 - **最优巡航马赫数**: {mach_opt:.3f}
+- **建议巡航高度**: {rec_alt:.0f} ft
 """
+    
+    progress(0.95, desc="正在保存文件...")
+    # 保存 CSV
+    csv_filename = f"flight_trajectory_{aircraft_type}_{route['origin_code']}-{route['dest_code']}.csv"
+    trajectory_df.to_csv(csv_filename, index=False)
     
     progress(1.0, desc="完成!")
     
-    return map_fig, analysis_fig, attitude_fig, control_fig, energy_fig, stats
+    return map_fig, analysis_fig, attitude_fig, control_fig, energy_fig, stats, gr.File(value=csv_filename, visible=True)
 
 
 # 创建 Gradio 界面
@@ -637,10 +678,12 @@ with demo:
                 label="🛩️ 选择机型",
                 value=aircraft_options[0] if aircraft_options else None
             )
-            aircraft_info = gr.Markdown("*选择机型后显示速度范围*")
+            aircraft_info = gr.Markdown("*选择机型后显示参数范围*")
         with gr.Column(scale=2):
-            # 初始化巡航速度滑动条
+            # 初始化滑动条
             mach_min, mach_max, mach_opt = get_speed_range(aircraft_options[0] if aircraft_options else None)
+            alt_min, alt_max, alt_rec = get_altitude_range(aircraft_options[0] if aircraft_options else None)
+            
             cruise_slider = gr.Slider(
                 minimum=mach_min,
                 maximum=mach_max,
@@ -648,8 +691,17 @@ with demo:
                 step=0.005,
                 label=f"🚀 巡航马赫数 ({mach_min:.2f} - {mach_max:.2f})"
             )
+            
+            alt_slider = gr.Slider(
+                minimum=alt_min,
+                maximum=alt_max,
+                value=alt_rec,
+                step=500,
+                label=f"🏔️ 巡航高度 ({alt_min:.0f} - {alt_max:.0f} ft)"
+            )
         with gr.Column(scale=1):
             run_btn = gr.Button("🚀 Run", variant="primary", size="lg")
+            download_file = gr.File(label="📥 下载 CSV", visible=False)
     
     with gr.Row():
         with gr.Column(scale=3):
@@ -676,15 +728,15 @@ with demo:
     )
     
     aircraft_dropdown.change(
-        fn=update_speed_slider,
+        fn=lambda ac: (update_speed_slider(ac)[0], update_speed_slider(ac)[1], update_altitude_slider(ac)),
         inputs=[aircraft_dropdown],
-        outputs=[cruise_slider, aircraft_info]
+        outputs=[cruise_slider, aircraft_info, alt_slider]
     )
     
     run_btn.click(
         fn=run_simulation,
-        inputs=[route_dropdown, aircraft_dropdown, cruise_slider],
-        outputs=[map_plot, analysis_plot, attitude_plot, control_plot, energy_plot, stats_md]
+        inputs=[route_dropdown, aircraft_dropdown, cruise_slider, alt_slider],
+        outputs=[map_plot, analysis_plot, attitude_plot, control_plot, energy_plot, stats_md, download_file]
     )
 
 
