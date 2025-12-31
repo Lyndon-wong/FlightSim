@@ -13,8 +13,8 @@ COPY . /app
 # 安装 Python 依赖
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 确保 gradio 6.2.0 是最终版本（覆盖任何可能的降级）
-RUN pip install --no-cache-dir "gradio>=6.2.0" "huggingface_hub>=0.25.1,<1.0.0"
+# 确保 gradio 6.2.0 和 gradio_client 2.0.2 是最终版本
+RUN pip install --no-cache-dir "gradio>=6.2.0" "gradio_client==2.0.2" "huggingface_hub>=0.25.1,<1.0.0"
 
 # 创建用户目录
 RUN mkdir -p /home/user && ln -s /app /home/user/app || true
