@@ -1,3 +1,15 @@
+---
+title: FlightSim
+emoji: ✈️
+colorFrom: blue
+colorTo: sky
+sdk: gradio
+sdk_version: 4.12.0
+app_file: examples/gradio_demo.py
+pinned: false
+license: mit
+---
+
 # FlightSim ✈️
 
 FlightSim 是一个独立的、高性能的民航飞行轨迹生成与仿真库。基于六自由度（6-DOF）动力学模型，能够生成高保真的飞行轨迹数据。
@@ -52,6 +64,15 @@ python examples/gradio_demo.py
 ```
 
 在浏览器中打开显示的 URL 即可使用。
+
+### 部署到 Hugging Face Spaces
+
+本项目已配置为可以直接部署到 [Hugging Face Spaces](https://huggingface.co/spaces)。
+
+1.  在 Hugging Face 创建一个新的 Space。
+2.  选择 **Gradio** 作为 SDK。
+3.  将本项目的所有文件上传到 Space 的仓库中。
+4.  Space 将自动检测 `README.md` 中的配置并启动演示。
 
 ## 核心模块
 
