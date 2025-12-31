@@ -1,0 +1,15 @@
+README.md
+pyproject.toml
+src/flightsim/__init__.py
+src/flightsim/aerodynamics.py
+src/flightsim/autopilot.py
+src/flightsim/data_generator.py
+src/flightsim/navigation.py
+src/flightsim/noise.py
+src/flightsim/sixdof.py
+src/flightsim.egg-info/PKG-INFO
+src/flightsim.egg-info/SOURCES.txt
+src/flightsim.egg-info/dependency_links.txt
+src/flightsim.egg-info/requires.txt
+src/flightsim.egg-info/top_level.txt
+tests/test_core.py
