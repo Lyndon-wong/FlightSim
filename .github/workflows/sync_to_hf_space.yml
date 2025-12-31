@@ -23,4 +23,4 @@ jobs:
           HF_SPACE_NAME: FlightSim
         run: |
           git remote add space https://$HF_USERNAME:$HF_TOKEN@huggingface.co/spaces/$HF_USERNAME/$HF_SPACE_NAME
-          git push --force space main
+          git push --force space master:main
