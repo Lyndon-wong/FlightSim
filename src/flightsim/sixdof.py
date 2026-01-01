@@ -3,8 +3,9 @@
 实现基于真实飞机参数的高保真飞行器动力学仿真
 """
 import numpy as np
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 from .aerodynamics import AircraftParams, get_aircraft
+from .noise import NoiseConfig, NoiseManager
 
 
 class SixDOFModel:
@@ -20,7 +21,8 @@ class SixDOFModel:
     """
     
     def __init__(self, aircraft_type: str, start_lat: float, start_lon: float, 
-                 start_alt: float, start_heading: float, dt: float = 1.0):
+                 start_alt: float, start_heading: float, dt: float = 1.0,
+                 noise_config: Optional[NoiseConfig] = None):
         """
         初始化六自由度模型
         
@@ -31,9 +33,23 @@ class SixDOFModel:
             start_alt: 起始高度（米）
             start_heading: 起始航向（度）
             dt: 时间步长（秒）
+            noise_config: 噪声配置（可选）
         """
         self.params: AircraftParams = get_aircraft(aircraft_type)
         self.dt = dt
+        
+        # 噪声模型
+        self.noise_config = noise_config
+        self.noise_manager = NoiseManager(
+            config=noise_config,
+            dt=dt,
+            wingspan=get_aircraft(aircraft_type).wingspan_m
+        ) if noise_config else None
+        
+        # 阵风速度分量 (用于状态输出)
+        self.gust_u = 0.0  # 纵向阵风
+        self.gust_v = 0.0  # 横向阵风
+        self.gust_w = 0.0  # 垂向阵风
         
         # 位置状态
         self.lat = start_lat
@@ -294,6 +310,14 @@ class SixDOFModel:
         # 指示空速修正（简化）
         self.ias = self.tas * np.sqrt(rho / 1.225)
         
+        # 风场噪声处理
+        if self.noise_manager and self.noise_config and self.noise_config.wind_intensity > 0:
+            self.gust_u, self.gust_v, self.gust_w = self.noise_manager.get_wind_gust(
+                self.alt, self.tas
+            )
+        else:
+            self.gust_u, self.gust_v, self.gust_w = 0.0, 0.0, 0.0
+        
         # 姿态更新（一阶惯性环节）
         max_pitch_rate = self.params.max_pitch_rate * self.dt
         max_roll_rate = self.params.max_roll_rate * self.dt
@@ -313,12 +337,35 @@ class SixDOFModel:
             self.spoilers, self.mach
         )
         
-        # 动压
-        q_bar = 0.5 * rho * max(self.tas, 1.0)**2
+        # 计算有效空速（考虑阵风）
+        effective_tas = max(self.tas + self.gust_u, 1.0)
+        
+        # 动压（使用有效空速）
+        q_bar = 0.5 * rho * effective_tas**2
+        
+        # 垂向阵风导致的攻角变化
+        if self.tas > 20:
+            delta_alpha = np.degrees(np.arctan2(self.gust_w, self.tas))
+            effective_alpha = self.alpha + delta_alpha
+            # 重新计算气动系数（如果有显著攻角变化）
+            if abs(delta_alpha) > 0.1:
+                cl, cd = self._calculate_aero(
+                    effective_alpha, self.flaps_idx, self.gear_down,
+                    self.spoilers, self.mach
+                )
         
         # 气动力
         self.lift = cl * q_bar * self.params.wing_area_m2
         self.drag = cd * q_bar * self.params.wing_area_m2
+        
+        # 气动摄动（如果启用）
+        if self.noise_manager and self.noise_config and self.noise_config.aero_perturbation > 0:
+            force_pert, moment_pert = self.noise_manager.get_aero_perturbation(
+                q_bar, self.params.wing_area_m2, self.params.wingspan_m
+            )
+            # 将摄动力添加到升力和阻力
+            self.lift += force_pert[2]  # 垂向力摄动
+            self.drag += abs(force_pert[0])  # 纵向力摄动
         
         # 推力
         self.thrust = self._calculate_thrust(throttle_pct, self.alt, self.mach, temp)
@@ -348,6 +395,14 @@ class SixDOFModel:
             
             # 载荷因子
             self.load_factor = lift_vert / weight
+            
+            # 横向阵风导致的侧滑
+            if abs(self.gust_v) > 0.1:
+                # 简化模型：横向阵风产生侧向力
+                side_force = 0.5 * rho * self.gust_v**2 * self.params.wing_area_m2 * 0.3
+                lateral_acc = side_force / self.current_mass_kg
+                # 影响航向（简化）
+                self.heading = (self.heading + np.degrees(lateral_acc * 0.01) * self.dt) % 360
             
             # 转弯（侧向运动）
             lift_horiz = self.lift * np.sin(np.radians(self.roll))
@@ -411,6 +466,11 @@ class SixDOFModel:
             "gs": self.gs,    # 地速 (m/s)
             "speed_v": self.v_vertical,  # 垂直速度 (m/s)
             "mach": self.mach,
+            
+            # 阵风分量
+            "gust_u": self.gust_u,  # 纵向阵风 (m/s)
+            "gust_v": self.gust_v,  # 横向阵风 (m/s)
+            "gust_w": self.gust_w,  # 垂向阵风 (m/s)
             
             # 姿态
             "heading": self.heading,

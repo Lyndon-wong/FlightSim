@@ -25,6 +25,7 @@ from flightsim.sixdof import SixDOFModel
 from flightsim.autopilot import FlightPhase, create_autopilot
 from flightsim.navigation import NavUtils
 from flightsim.aerodynamics import get_database
+from flightsim.noise import NoiseConfig, NoiseManager
 
 # 数据文件路径
 DATA_DIR = PROJECT_ROOT / "data"
@@ -43,7 +44,8 @@ aircraft_options = aircraft_df['aircraft_type'].tolist()
 
 def generate_trajectory(aircraft_type: str, route_data: pd.Series, 
                         cruise_speed_mach: float = None, cruise_alt_ft: float = None, 
-                        dt: float = 2.0, max_time: float = None):
+                        dt: float = 2.0, max_time: float = None,
+                        noise_config: NoiseConfig = None):
     """
     使用六自由度模型生成完整飞行轨迹
     
@@ -54,6 +56,7 @@ def generate_trajectory(aircraft_type: str, route_data: pd.Series,
         cruise_alt_ft: 巡航高度（英尺）（可选，使用默认高度时为None）
         dt: 时间步长（秒）
         max_time: 最大仿真时间（秒）
+        noise_config: 噪声配置（可选）
     
     Returns:
         DataFrame: 轨迹数据
@@ -84,9 +87,14 @@ def generate_trajectory(aircraft_type: str, route_data: pd.Series,
         waypoints[0][0], waypoints[0][1], waypoints[1][0], waypoints[1][1]
     )
     
-    # 初始化模型
+    # 初始化模型（过程噪声通过noise_config传入）
     model = SixDOFModel(aircraft_type, waypoints[0][0], waypoints[0][1],
-                        10.0, runway_heading, dt)
+                        10.0, runway_heading, dt, noise_config=noise_config)
+    
+    # 初始化量测噪声管理器（用于后处理）
+    meas_noise_manager = None
+    if noise_config and noise_config.has_measurement_noise():
+        meas_noise_manager = NoiseManager(config=noise_config, dt=dt, wingspan=35.0)
     
     # 获取机型航程分类
     ac_info = aircraft_df[aircraft_df['aircraft_type'] == aircraft_type].iloc[0]
@@ -114,22 +122,57 @@ def generate_trajectory(aircraft_type: str, route_data: pd.Series,
             state['lat'], state['lon'], waypoints[-1][0], waypoints[-1][1]
         )
         
+        # 真值
+        true_lat = state['lat']
+        true_lon = state['lon']
+        true_alt = state['alt']
+        true_tas = state['tas']
+        true_heading = state['heading']
+        true_pitch = state['pitch']
+        true_roll = state['roll']
+        
+        # 带噪声的量测值（默认等于真值）
+        meas_lat, meas_lon, meas_alt = true_lat, true_lon, true_alt
+        meas_tas = true_tas
+        
+        # 应用量测噪声
+        if meas_noise_manager:
+            # GPS噪声应用于位置和速度
+            meas_lat, meas_lon, meas_alt, _ = meas_noise_manager.apply_gps_noise(
+                true_lat, true_lon, true_alt, np.array([true_tas, 0, 0])
+            )
+            # 速度噪声
+            vel_noise = np.random.randn() * meas_noise_manager.gps_noise.vel_sigma
+            meas_tas = max(0, true_tas + vel_noise)
+        
         trajectory.append({
             'time': time,
-            'lat': state['lat'],
-            'lon': state['lon'],
-            'alt': state['alt'],
-            'tas': state['tas'],
-            'heading': state['heading'],
-            'pitch': state['pitch'],
-            'roll': state['roll'],
+            # 真值
+            'lat_true': true_lat,
+            'lon_true': true_lon,
+            'alt_true': true_alt,
+            'tas_true': true_tas,
+            'heading_true': true_heading,
+            'pitch_true': true_pitch,
+            'roll_true': true_roll,
+            # 带噪声的量测值
+            'lat': meas_lat,
+            'lon': meas_lon,
+            'alt': meas_alt,
+            'tas': meas_tas,
+            'heading': true_heading,  # 航向通常由磁力计提供，此处简化
+            'pitch': true_pitch,
+            'roll': true_roll,
             'flight_phase': phase.value,
             'throttle': throttle,
-            'target_pitch': pitch,      # 控制指令：目标俯仰
-            'target_roll': roll,        # 控制指令：目标滚转
+            'target_pitch': pitch,
+            'target_roll': roll,
             'dist_to_dest': dist_to_dest,
             'fuel': state['fuel'],
-            'mass': state.get('mass', state['fuel'] + 50000)  # 飞机质量用于能量计算
+            'mass': state.get('mass', state['fuel'] + 50000),
+            'gust_u': state.get('gust_u', 0),
+            'gust_v': state.get('gust_v', 0),
+            'gust_w': state.get('gust_w', 0),
         })
         
         # 终止条件：着陆滑跑结束
@@ -152,12 +195,27 @@ def create_map_figure(trajectory_df, route):
     """创建地图可视化 - 白色背景，自动缩放到航线区域"""
     fig = go.Figure()
     
-    # 飞行轨迹
+    # 检查是否有真值列
+    has_true_values = 'lat_true' in trajectory_df.columns
+    
+    # 真值轨迹（如果存在）
+    if has_true_values:
+        fig.add_trace(go.Scattergeo(
+            lon=trajectory_df['lon_true'],
+            lat=trajectory_df['lat_true'],
+            mode='lines',
+            line=dict(width=2, color='rgba(39, 174, 96, 0.7)', dash='dot'),
+            name='真值轨迹',
+            hovertemplate='真值<br>高度: %{customdata:.0f}m<extra></extra>',
+            customdata=trajectory_df['alt_true']
+        ))
+    
+    # 带噪声的量测轨迹
     fig.add_trace(go.Scattergeo(
         lon=trajectory_df['lon'],
         lat=trajectory_df['lat'],
         mode='lines+markers',
-        line=dict(width=2.5, color='rgba(65, 105, 225, 0.8)'),
+        line=dict(width=2.5, color='rgba(231, 76, 60, 0.8)' if has_true_values else 'rgba(65, 105, 225, 0.8)'),
         marker=dict(
             size=3,
             color=trajectory_df['alt'],
@@ -165,8 +223,8 @@ def create_map_figure(trajectory_df, route):
             showscale=True,
             colorbar=dict(title='高度 (m)', x=1.02, thickness=15)
         ),
-        name='飞行轨迹',
-        hovertemplate='时间: %{customdata[0]:.0f}s<br>高度: %{customdata[1]:.0f}m<br>速度: %{customdata[2]:.1f}m/s<extra></extra>',
+        name='量测轨迹' if has_true_values else '飞行轨迹',
+        hovertemplate='量测<br>时间: %{customdata[0]:.0f}s<br>高度: %{customdata[1]:.0f}m<extra></extra>',
         customdata=trajectory_df[['time', 'alt', 'tas']].values
     ))
     
@@ -248,29 +306,56 @@ def create_analysis_figure(trajectory_df):
     
     time_min = trajectory_df['time'] / 60
     
-    # 1. 高度剖面
+    # 检查是否有真值列
+    has_true_values = 'alt_true' in trajectory_df.columns
+    
+    # 1. 高度剖面 - 真值 vs 量测值
+    if has_true_values:
+        fig.add_trace(
+            go.Scatter(
+                x=time_min, y=trajectory_df['alt_true'], 
+                line=dict(color='#4169E1', width=1, dash='dot'),
+                name='高度(真值)',
+                hovertemplate='真值: %{y:.0f}m<extra></extra>',
+                showlegend=True
+            ),
+            row=1, col=1
+        )
     fig.add_trace(
         go.Scatter(
             x=time_min, y=trajectory_df['alt'], 
-            fill='tozeroy', fillcolor='rgba(65, 105, 225, 0.2)',
-            line=dict(color='#4169E1', width=2), 
-            name='高度',
-            hovertemplate='时间: %{x:.1f}分钟<br>高度: %{y:.0f}m<extra></extra>'
+            fill='tozeroy' if not has_true_values else None,
+            fillcolor='rgba(65, 105, 225, 0.2)' if not has_true_values else None,
+            line=dict(color='#e74c3c' if has_true_values else '#4169E1', width=2), 
+            name='高度(量测)' if has_true_values else '高度',
+            hovertemplate='量测: %{y:.0f}m<extra></extra>'
         ),
         row=1, col=1
     )
     
-    # 2. 速度曲线 (转换为节)
+    # 2. 速度曲线 - 真值 vs 量测值
+    if has_true_values:
+        speed_true_knots = trajectory_df['tas_true'] * 1.944
+        fig.add_trace(
+            go.Scatter(
+                x=time_min, y=speed_true_knots,
+                line=dict(color='#27ae60', width=1, dash='dot'), 
+                name='速度(真值)',
+                hovertemplate='真值: %{y:.0f}节<extra></extra>'
+            ),
+            row=1, col=2
+        )
     speed_knots = trajectory_df['tas'] * 1.944
     fig.add_trace(
         go.Scatter(
             x=time_min, y=speed_knots,
             line=dict(color='#e74c3c', width=2), 
-            name='速度',
-            hovertemplate='时间: %{x:.1f}分钟<br>速度: %{y:.0f}节<extra></extra>'
+            name='速度(量测)' if has_true_values else '速度',
+            hovertemplate='量测: %{y:.0f}节<extra></extra>'
         ),
         row=1, col=2
     )
+
     
     # 3. 飞行阶段时间轴 - 修复：按时间顺序排列，正确显示所有阶段
     import plotly.express as px
@@ -686,6 +771,13 @@ def process_dataframe(df: pd.DataFrame, unit_system: str, time_format: str) -> p
 
 
 def run_simulation(route_name: str, aircraft_type: str, cruise_mach: float, cruise_alt_m: float, 
+                   wind_noise: float, aero_pert: float,
+                   imu_noise: float, imu_type: str, imu_flicker_prob: float, imu_flicker_scale: float,
+                   imu_drift_rate: float, imu_colored_alpha: float,
+                   imu_timevar_period: float, imu_timevar_amp: float,
+                   gps_noise: float, gps_type: str, gps_flicker_prob: float, gps_flicker_scale: float,
+                   gps_drift_rate: float, gps_colored_alpha: float,
+                   gps_timevar_period: float, gps_timevar_amp: float,
                    unit_system: str, time_format: str, progress=gr.Progress()):
     """运行模拟并返回可视化结果"""
     if not route_name or not aircraft_type:
@@ -698,13 +790,38 @@ def run_simulation(route_name: str, aircraft_type: str, cruise_mach: float, crui
     # 将输入高度（米）转换为英尺供底层使用
     cruise_alt_ft = cruise_alt_m * 3.28084
     
+    # 创建噪声配置
+    noise_config = None
+    if wind_noise > 0 or aero_pert > 0 or imu_noise > 0 or gps_noise > 0:
+        noise_config = NoiseConfig(
+            wind_intensity=wind_noise,
+            aero_perturbation=aero_pert,
+            imu_noise=imu_noise,
+            imu_noise_type=imu_type,
+            imu_flicker_prob=imu_flicker_prob,
+            imu_flicker_scale=imu_flicker_scale,
+            imu_drift_rate=imu_drift_rate,
+            imu_colored_alpha=imu_colored_alpha,
+            imu_timevar_period=imu_timevar_period,
+            imu_timevar_amp=imu_timevar_amp,
+            gps_noise=gps_noise,
+            gps_noise_type=gps_type,
+            gps_flicker_prob=gps_flicker_prob,
+            gps_flicker_scale=gps_flicker_scale,
+            gps_drift_rate=gps_drift_rate,
+            gps_colored_alpha=gps_colored_alpha,
+            gps_timevar_period=gps_timevar_period,
+            gps_timevar_amp=gps_timevar_amp
+        )
+    
     progress(0.1, desc="正在初始化模型...")
     
-    # 生成轨迹（使用指定的巡航速度）
+    # 生成轨迹（使用指定的巡航速度和噪声配置）
     progress(0.2, desc="正在生成飞行轨迹...")
     trajectory_df = generate_trajectory(aircraft_type, route, 
                                       cruise_speed_mach=cruise_mach,
-                                      cruise_alt_ft=cruise_alt_ft)
+                                      cruise_alt_ft=cruise_alt_ft,
+                                      noise_config=noise_config)
     
     progress(0.6, desc="正在生成可视化...")
     
@@ -795,70 +912,174 @@ with demo:
     gr.Markdown("""
     # ✈️FlightSim
     
-    基于六自由度动力学模型的飞行轨迹生成与可视化工具。选择航线和机型，调整巡航速度，点击 **Run** 生成完整飞行轨迹。
+    基于六自由度动力学模型的飞行轨迹生成与可视化工具。
     """)
     
+    # 参数设置区域 - 使用Tab分组
     with gr.Row():
-        with gr.Column(scale=3):
-            route_dropdown = gr.Dropdown(
-                choices=route_options,
-                label="🛫 选择航线",
-                value=route_options[0] if route_options else None,
-                filterable=True
-            )
-            route_info = gr.Markdown("### 📍 航线信息\n*请选择航线*")
-        with gr.Column(scale=2):
-            aircraft_dropdown = gr.Dropdown(
-                choices=aircraft_options,
-                label="🛩️ 选择机型",
-                value=aircraft_options[0] if aircraft_options else None
-            )
-            aircraft_info = gr.Markdown("*选择机型后显示参数范围*")
-        with gr.Column(scale=2):
-            # 初始化滑动条
-            mach_min, mach_max, mach_opt = get_speed_range(aircraft_options[0] if aircraft_options else None)
-            
-            # 高度范围（米）
-            alt_min_ft, alt_max_ft, alt_rec_ft = get_altitude_range(aircraft_options[0] if aircraft_options else None)
-            alt_min_m = int(alt_min_ft * 0.3048 / 100) * 100
-            alt_max_m = int(alt_max_ft * 0.3048 / 100) * 100
-            alt_rec_m = int(alt_rec_ft * 0.3048 / 100) * 100
-            
-            cruise_slider = gr.Slider(
-                minimum=mach_min,
-                maximum=mach_max,
-                value=mach_opt,
-                step=0.005,
-                label=f"🚀 巡航马赫数 ({mach_min:.2f} - {mach_max:.2f})"
-            )
-            
-            alt_slider = gr.Slider(
-                minimum=alt_min_m,
-                maximum=alt_max_m,
-                value=alt_rec_m,
-                step=100,
-                label=f"🏔️ 巡航高度 ({alt_min_m} - {alt_max_m} m)"
-            )
-            
-            with gr.Row():
-                unit_radio = gr.Radio(
-                    choices=["公制", "英制"],
-                    value="公制",
-                    label="单位",
-                    scale=1,
-                    container=False
-                )
-                time_radio = gr.Radio(
-                    choices=["仿真时间", "真实时间"],
-                    value="仿真时间",
-                    label="时间",
-                    scale=1,
-                    container=False
-                )
+        with gr.Column(scale=4):
+            with gr.Tabs():
+                # Tab 1: 必选参数
+                with gr.TabItem("🎯 航线与机型"):
+                    with gr.Row():
+                        with gr.Column(scale=1):
+                            route_dropdown = gr.Dropdown(
+                                choices=route_options,
+                                label="🛫 选择航线",
+                                value=route_options[0] if route_options else None,
+                                filterable=True
+                            )
+                            route_info = gr.Markdown("### 📍 航线信息\n*请选择航线*")
+                        with gr.Column(scale=1):
+                            aircraft_dropdown = gr.Dropdown(
+                                choices=aircraft_options,
+                                label="🛩️ 选择机型",
+                                value=aircraft_options[0] if aircraft_options else None
+                            )
+                            aircraft_info = gr.Markdown("*选择机型后显示参数*")
                 
+                # Tab 2: 飞行参数（巡航+环境扰动）
+                with gr.TabItem("⚙️ 飞行参数"):
+                    # 初始化滑动条默认值
+                    mach_min, mach_max, mach_opt = get_speed_range(aircraft_options[0] if aircraft_options else None)
+                    alt_min_ft, alt_max_ft, alt_rec_ft = get_altitude_range(aircraft_options[0] if aircraft_options else None)
+                    alt_min_m = int(alt_min_ft * 0.3048 / 100) * 100
+                    alt_max_m = int(alt_max_ft * 0.3048 / 100) * 100
+                    alt_rec_m = int(alt_rec_ft * 0.3048 / 100) * 100
+                    
+                    gr.Markdown("**✈️ 巡航参数**")
+                    with gr.Row():
+                        cruise_slider = gr.Slider(
+                            minimum=mach_min, maximum=mach_max, value=mach_opt, step=0.005,
+                            label=f"🚀 巡航马赫数 ({mach_min:.2f} - {mach_max:.2f})"
+                        )
+                        alt_slider = gr.Slider(
+                            minimum=alt_min_m, maximum=alt_max_m, value=alt_rec_m, step=100,
+                            label=f"🏔️ 巡航高度 ({alt_min_m} - {alt_max_m} m)"
+                        )
+                    
+                    gr.Markdown("**🌪️ 环境扰动**")
+                    with gr.Row():
+                        wind_noise_slider = gr.Slider(
+                            minimum=0.0, maximum=1.0, value=0.0, step=0.05,
+                            label="风场湍流强度",
+                            info="Dryden模型 σ: 0.5~6 m/s"
+                        )
+                        aero_pert_slider = gr.Slider(
+                            minimum=0.0, maximum=1.0, value=0.0, step=0.05,
+                            label="气动摄动强度",
+                            info="湍流引起的气动力扰动 0~5%"
+                        )
+                    
+                    gr.Markdown("**📁 导出设置**")
+                    with gr.Row():
+                        unit_radio = gr.Radio(
+                            choices=["公制", "英制"], value="公制", label="导出单位", container=False
+                        )
+                        time_radio = gr.Radio(
+                            choices=["仿真时间", "真实时间"], value="仿真时间", label="时间格式", container=False
+                        )
+                
+                # Tab 3: 量测噪声（独立Tab）
+                with gr.TabItem("📡 量测噪声"):
+                    with gr.Row():
+                        # IMU噪声配置
+                        with gr.Column():
+                            gr.Markdown("### 📊 IMU 噪声")
+                            imu_type_dropdown = gr.Dropdown(
+                                choices=["white", "flicker", "drift", "colored", "timevar"],
+                                value="white",
+                                label="噪声类型"
+                            )
+                            imu_formula_md = gr.Markdown("**white**: x̃ = x + N(0, σ²), σ: 噪声标准差")
+                            imu_noise_slider = gr.Slider(
+                                minimum=0.0, maximum=1.0, value=0.0, step=0.05,
+                                label="噪声强度 σ"
+                            )
+                            # 闪烁参数 (flicker)
+                            with gr.Row(visible=False) as imu_flicker_row:
+                                imu_flicker_prob = gr.Slider(
+                                    minimum=0.0, maximum=1.0, value=0.1, step=0.05,
+                                    label="闪烁概率 p"
+                                )
+                                imu_flicker_scale = gr.Slider(
+                                    minimum=0.0, maximum=50.0, value=5.0, step=1.0,
+                                    label="闪烁幅度 k"
+                                )
+                            # 漂移参数 (drift)
+                            with gr.Row(visible=False) as imu_drift_row:
+                                imu_drift_rate = gr.Slider(
+                                    minimum=0.0, maximum=0.02, value=0.002, step=0.001,
+                                    label="漂移率 r"
+                                )
+                            # 有色参数 (colored)
+                            with gr.Row(visible=False) as imu_colored_row:
+                                imu_colored_alpha = gr.Slider(
+                                    minimum=0.5, maximum=0.99, value=0.9, step=0.01,
+                                    label="相关系数 α"
+                                )
+                            # 时变参数 (timevar)
+                            with gr.Row(visible=False) as imu_timevar_row:
+                                imu_timevar_period = gr.Slider(
+                                    minimum=10, maximum=1000, value=100, step=10,
+                                    label="变化周期 T"
+                                )
+                                imu_timevar_amp = gr.Slider(
+                                    minimum=0.0, maximum=5.0, value=1.0, step=0.1,
+                                    label="变化幅度 A"
+                                )
+                        
+                        # GPS噪声配置
+                        with gr.Column():
+                            gr.Markdown("### 📍 GPS 噪声")
+                            gps_type_dropdown = gr.Dropdown(
+                                choices=["white", "flicker", "drift", "colored", "timevar"],
+                                value="white",
+                                label="噪声类型"
+                            )
+                            gps_formula_md = gr.Markdown("**white**: x̃ = x + N(0, σ²), σ: 噪声标准差")
+                            gps_noise_slider = gr.Slider(
+                                minimum=0.0, maximum=1.0, value=0.0, step=0.05,
+                                label="噪声强度 σ"
+                            )
+                            # 闪烁参数 (flicker)
+                            with gr.Row(visible=False) as gps_flicker_row:
+                                gps_flicker_prob = gr.Slider(
+                                    minimum=0.0, maximum=1.0, value=0.1, step=0.05,
+                                    label="闪烁概率 p"
+                                )
+                                gps_flicker_scale = gr.Slider(
+                                    minimum=0.0, maximum=50.0, value=5.0, step=1.0,
+                                    label="闪烁幅度 k"
+                                )
+                            # 漂移参数 (drift)
+                            with gr.Row(visible=False) as gps_drift_row:
+                                gps_drift_rate = gr.Slider(
+                                    minimum=0.0, maximum=0.02, value=0.002, step=0.001,
+                                    label="漂移率 r"
+                                )
+                            # 有色参数 (colored)
+                            with gr.Row(visible=False) as gps_colored_row:
+                                gps_colored_alpha = gr.Slider(
+                                    minimum=0.5, maximum=0.99, value=0.9, step=0.01,
+                                    label="相关系数 α"
+                                )
+                            # 时变参数 (timevar)
+                            with gr.Row(visible=False) as gps_timevar_row:
+                                gps_timevar_period = gr.Slider(
+                                    minimum=10, maximum=1000, value=100, step=10,
+                                    label="变化周期 T"
+                                )
+                                gps_timevar_amp = gr.Slider(
+                                    minimum=0.0, maximum=5.0, value=1.0, step=0.1,
+                                    label="变化幅度 A"
+                                )
+        
+        # 运行按钮和下载
         with gr.Column(scale=1):
             run_btn = gr.Button("🚀 Run", variant="primary", size="lg")
             download_file = gr.File(label="📥 下载 CSV", visible=False)
+
     
     with gr.Tabs():
         with gr.TabItem("🌍 轨迹概览"):
@@ -890,9 +1111,46 @@ with demo:
         outputs=[cruise_slider, aircraft_info, alt_slider]
     )
     
+    # 噪声类型变更事件 - 控制参数显示和公式说明
+    def update_noise_params_visibility(noise_type):
+        formulas = {
+            "white": "**white**: x̃ = x + N(0, σ²), σ: 噪声标准差",
+            "flicker": "**flicker**: x̃ = x + k·N(0, σ²) if rand < p, p: 闪烁概率, k: 闪烁幅度",
+            "drift": "**drift**: b(t) = b(t-1) + N(0, r²·σ²), x̃ = x + b(t), r: 漂移率",
+            "colored": "**colored**: n(t) = α·n(t-1) + √(1-α²)·N(0, σ²), α: 相关系数",
+            "timevar": "**timevar**: σ(t) = σ·(1 + A·sin(2πt/T)), T: 变化周期, A: 变化幅度"
+        }
+        return (
+            formulas.get(noise_type, formulas["white"]),
+            gr.update(visible=(noise_type == "flicker")),  # flicker_row
+            gr.update(visible=(noise_type == "drift")),    # drift_row
+            gr.update(visible=(noise_type == "colored")),  # colored_row
+            gr.update(visible=(noise_type == "timevar"))   # timevar_row
+        )
+    
+    imu_type_dropdown.change(
+        fn=update_noise_params_visibility,
+        inputs=[imu_type_dropdown],
+        outputs=[imu_formula_md, imu_flicker_row, imu_drift_row, imu_colored_row, imu_timevar_row]
+    )
+    
+    gps_type_dropdown.change(
+        fn=update_noise_params_visibility,
+        inputs=[gps_type_dropdown],
+        outputs=[gps_formula_md, gps_flicker_row, gps_drift_row, gps_colored_row, gps_timevar_row]
+    )
+    
     run_btn.click(
         fn=run_simulation,
-        inputs=[route_dropdown, aircraft_dropdown, cruise_slider, alt_slider, unit_radio, time_radio],
+        inputs=[route_dropdown, aircraft_dropdown, cruise_slider, alt_slider, 
+                wind_noise_slider, aero_pert_slider,
+                imu_noise_slider, imu_type_dropdown, imu_flicker_prob, imu_flicker_scale,
+                imu_drift_rate, imu_colored_alpha,
+                imu_timevar_period, imu_timevar_amp,
+                gps_noise_slider, gps_type_dropdown, gps_flicker_prob, gps_flicker_scale,
+                gps_drift_rate, gps_colored_alpha,
+                gps_timevar_period, gps_timevar_amp,
+                unit_radio, time_radio],
         outputs=[map_plot, analysis_plot, attitude_plot, control_plot, energy_plot, stats_md, download_file]
     )
 
