@@ -366,6 +366,19 @@ class SixDOFModel:
             # 将摄动力添加到升力和阻力
             self.lift += force_pert[2]  # 垂向力摄动
             self.drag += abs(force_pert[0])  # 纵向力摄动
+            
+            # 将力矩摄动应用于姿态 (简化惯性响应)
+            # 假设简单的力矩-角速度响应：Moment -> Angular Rate change
+            # 简化缩放系数，将N·m映射到deg/s
+            moment_sensitivity = 0.0001 / self.params.typical_mass_kg * 50000  # 归一化质量影响
+            
+            d_p = moment_pert[0] * moment_sensitivity  # 滚转力矩 -> 滚转速率变化
+            d_q = moment_pert[1] * moment_sensitivity  # 俯仰力矩 -> 俯仰速率变化
+            d_r = moment_pert[2] * moment_sensitivity  # 偏航力矩 -> 偏航速率变化
+            
+            self.roll += d_p * self.dt
+            self.pitch += d_q * self.dt
+            self.heading = (self.heading + d_r * self.dt) % 360
         
         # 推力
         self.thrust = self._calculate_thrust(throttle_pct, self.alt, self.mach, temp)

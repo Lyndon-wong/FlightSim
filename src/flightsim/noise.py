@@ -602,6 +602,23 @@ class NoiseManager:
                         true_gyro: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """应用IMU噪声"""
         return self.imu_noise.apply(true_acc, true_gyro)
+
+    def apply_attitude_noise(self, true_pitch: float, true_roll: float, true_heading: float) -> Tuple[float, float, float]:
+        """
+        应用姿态角噪声 (简化模拟AHRS误差)
+        使用IMU的陀螺仪噪声参数来生成角度噪声
+        """
+        # 将角度打包成向量
+        true_att = np.array([true_pitch, true_roll, true_heading])
+        # 构造虚拟加速度 (不使用)
+        dummy_acc = np.zeros(3)
+        
+        # 复用IMU噪声模型
+        # 注意：这会推进imu_noise的内部状态 (如漂移、有色噪声等)
+        # 我们忽略加速度噪声，仅使用陀螺仪部分作为角度噪声
+        _, noisy_att_vec = self.imu_noise.apply(dummy_acc, true_att)
+        
+        return noisy_att_vec[0], noisy_att_vec[1], noisy_att_vec[2]
     
     def apply_gps_noise(self, true_lat: float, true_lon: float, true_alt: float,
                         true_vel: np.ndarray) -> Tuple[float, float, float, np.ndarray]:

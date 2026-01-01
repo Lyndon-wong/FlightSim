@@ -136,6 +136,8 @@ def generate_trajectory(aircraft_type: str, route_data: pd.Series,
         meas_tas = true_tas
         
         # 应用量测噪声
+        meas_pitch, meas_roll, meas_heading = true_pitch, true_roll, true_heading
+        
         if meas_noise_manager:
             # GPS噪声应用于位置和速度
             meas_lat, meas_lon, meas_alt, _ = meas_noise_manager.apply_gps_noise(
@@ -144,6 +146,11 @@ def generate_trajectory(aircraft_type: str, route_data: pd.Series,
             # 速度噪声
             vel_noise = np.random.randn() * meas_noise_manager.gps_noise.vel_sigma
             meas_tas = max(0, true_tas + vel_noise)
+            
+            # IMU噪声应用于姿态角 (简化)
+            meas_pitch, meas_roll, meas_heading = meas_noise_manager.apply_attitude_noise(
+                true_pitch, true_roll, true_heading
+            )
         
         trajectory.append({
             'time': time,
@@ -160,9 +167,9 @@ def generate_trajectory(aircraft_type: str, route_data: pd.Series,
             'lon': meas_lon,
             'alt': meas_alt,
             'tas': meas_tas,
-            'heading': true_heading,  # 航向通常由磁力计提供，此处简化
-            'pitch': true_pitch,
-            'roll': true_roll,
+            'heading': meas_heading,  # 带噪声的航向
+            'pitch': meas_pitch,      # 带噪声的俯仰
+            'roll': meas_roll,        # 带噪声的滚转
             'flight_phase': phase.value,
             'throttle': throttle,
             'target_pitch': pitch,
@@ -328,7 +335,8 @@ def create_analysis_figure(trajectory_df):
             fillcolor='rgba(65, 105, 225, 0.2)' if not has_true_values else None,
             line=dict(color='#e74c3c' if has_true_values else '#4169E1', width=2), 
             name='高度(量测)' if has_true_values else '高度',
-            hovertemplate='量测: %{y:.0f}m<extra></extra>'
+            hovertemplate='量测: %{y:.0f}m<extra></extra>',
+            showlegend=True
         ),
         row=1, col=1
     )
@@ -341,7 +349,8 @@ def create_analysis_figure(trajectory_df):
                 x=time_min, y=speed_true_knots,
                 line=dict(color='#27ae60', width=1, dash='dot'), 
                 name='速度(真值)',
-                hovertemplate='真值: %{y:.0f}节<extra></extra>'
+                hovertemplate='真值: %{y:.0f}节<extra></extra>',
+                showlegend=True
             ),
             row=1, col=2
         )
@@ -351,7 +360,8 @@ def create_analysis_figure(trajectory_df):
             x=time_min, y=speed_knots,
             line=dict(color='#e74c3c', width=2), 
             name='速度(量测)' if has_true_values else '速度',
-            hovertemplate='量测: %{y:.0f}节<extra></extra>'
+            hovertemplate='量测: %{y:.0f}节<extra></extra>',
+            showlegend=True
         ),
         row=1, col=2
     )
@@ -410,7 +420,14 @@ def create_analysis_figure(trajectory_df):
     
     fig.update_layout(
         height=500,
-        showlegend=False,
+        showlegend=True,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="center",
+            x=0.5
+        ),
         paper_bgcolor='white',
         plot_bgcolor='white',
         font=dict(color='#333', size=11),
@@ -431,35 +448,71 @@ def create_attitude_figure(trajectory_df):
     
     time_min = trajectory_df['time'] / 60
     
-    # 俯仰角
+    # 检查是否有真值列
+    has_true_values = 'pitch_true' in trajectory_df.columns
+    
+    # 1. 俯仰角
+    if has_true_values:
+        fig.add_trace(
+            go.Scatter(
+                x=time_min, y=trajectory_df['pitch_true'],
+                line=dict(color='#3498db', width=1, dash='dot'),
+                name='俯仰(真值)',
+                hovertemplate='真值: %{y:.1f}°<extra></extra>',
+                showlegend=True
+            ),
+            row=1, col=1
+        )
     fig.add_trace(
         go.Scatter(
             x=time_min, y=trajectory_df['pitch'],
-            line=dict(color='#3498db', width=2),
-            name='俯仰角',
-            hovertemplate='时间: %{x:.1f}分钟<br>俯仰: %{y:.1f}°<extra></extra>'
+            line=dict(color='#2980b9' if has_true_values else '#3498db', width=2),
+            name='俯仰(量测)' if has_true_values else '俯仰角',
+            hovertemplate='量测: %{y:.1f}°<extra></extra>'
         ),
         row=1, col=1
     )
     
-    # 滚转角
+    # 2. 滚转角
+    if has_true_values:
+        fig.add_trace(
+            go.Scatter(
+                x=time_min, y=trajectory_df['roll_true'],
+                line=dict(color='#e67e22', width=1, dash='dot'),
+                name='滚转(真值)',
+                hovertemplate='真值: %{y:.1f}°<extra></extra>',
+                showlegend=True
+            ),
+            row=2, col=1
+        )
     fig.add_trace(
         go.Scatter(
             x=time_min, y=trajectory_df['roll'],
-            line=dict(color='#e67e22', width=2),
-            name='滚转角',
-            hovertemplate='时间: %{x:.1f}分钟<br>滚转: %{y:.1f}°<extra></extra>'
+            line=dict(color='#d35400' if has_true_values else '#e67e22', width=2),
+            name='滚转(量测)' if has_true_values else '滚转角',
+            hovertemplate='量测: %{y:.1f}°<extra></extra>'
         ),
         row=2, col=1
     )
     
-    # 航向
+    # 3. 航向
+    if has_true_values:
+        fig.add_trace(
+            go.Scatter(
+                x=time_min, y=trajectory_df['heading_true'],
+                line=dict(color='#27ae60', width=1, dash='dot'),
+                name='航向(真值)',
+                hovertemplate='真值: %{y:.0f}°<extra></extra>',
+                showlegend=True
+            ),
+            row=3, col=1
+        )
     fig.add_trace(
         go.Scatter(
             x=time_min, y=trajectory_df['heading'],
-            line=dict(color='#27ae60', width=2),
-            name='航向',
-            hovertemplate='时间: %{x:.1f}分钟<br>航向: %{y:.0f}°<extra></extra>'
+            line=dict(color='#2ecc71' if has_true_values else '#27ae60', width=2),
+            name='航向(量测)' if has_true_values else '航向',
+            hovertemplate='量测: %{y:.0f}°<extra></extra>'
         ),
         row=3, col=1
     )
@@ -471,7 +524,14 @@ def create_attitude_figure(trajectory_df):
     
     fig.update_layout(
         height=450,
-        showlegend=False,
+        showlegend=True,  # 显示图例以便区分真值和量测
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="center",
+            x=0.5
+        ),
         paper_bgcolor='white',
         plot_bgcolor='white',
         font=dict(color='#333', size=11),
@@ -550,10 +610,16 @@ def create_energy_figure(trajectory_df):
     time_min = trajectory_df['time'] / 60
     
     # 计算能量（单位：MJ）
+    # 使用真值计算能量（如果可用），以反映物理状态而不是量测误差
+    if 'alt_true' in trajectory_df.columns and 'tas_true' in trajectory_df.columns:
+        alt = trajectory_df['alt_true']
+        tas = trajectory_df['tas_true']
+    else:
+        alt = trajectory_df['alt']
+        tas = trajectory_df['tas']
+        
     g = 9.81  # 重力加速度
     mass = trajectory_df['mass']
-    alt = trajectory_df['alt']
-    tas = trajectory_df['tas']
     
     # 势能 Ep = mgh
     potential_energy = mass * g * alt / 1e6  # MJ
