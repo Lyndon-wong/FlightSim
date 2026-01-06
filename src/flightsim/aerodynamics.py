@@ -98,9 +98,9 @@ class AircraftDatabase:
             csv_path: plans.csv文件路径，如果为None则使用默认路径
         """
         if csv_path is None:
-            # 默认路径：src/flightsim/../../data/plans.csv
+            # 默认路径：src/flightsim/data/plans.csv
             current_dir = Path(__file__).parent
-            csv_path = current_dir.parent.parent / "data" / "plans.csv"
+            csv_path = current_dir / "data" / "plans.csv"
         
         self.csv_path = Path(csv_path)
         self._aircraft_db: Dict[str, AircraftParams] = {}

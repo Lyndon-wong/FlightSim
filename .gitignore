@@ -61,15 +61,20 @@ venv.bak/
 *~
 
 # Project specific
-# Ignore generated CSVs in root (if any accidental saves)
 *.csv
-# But keep data csvs
-!data/*.csv
-!data/**/*.csv
+
+# User requested explicitly ignored directories
+# Anchor to root to avoid ignoring src/flightsim/data
+/data/
+/generate_test/
+
+# Allow tracking of source data files
+!src/flightsim/data/
+!src/flightsim/data/*.csv
 
 # Gradio cache
 flagged/
 
-# User requested explicit rules
+# Other User requested explicit rules
 *.pyc
 __pycache__

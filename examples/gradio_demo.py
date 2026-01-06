@@ -28,7 +28,7 @@ from flightsim.aerodynamics import get_database
 from flightsim.noise import NoiseConfig, NoiseManager
 
 # 数据文件路径
-DATA_DIR = PROJECT_ROOT / "data"
+DATA_DIR = PROJECT_ROOT / "src/flightsim/data"
 WAYPOINTS_FILE = DATA_DIR / "waypoints.csv"
 PLANS_FILE = DATA_DIR / "plans.csv"
 
