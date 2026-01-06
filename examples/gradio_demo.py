@@ -205,10 +205,70 @@ def create_map_figure(trajectory_df, route):
     # 检查是否有真值列
     has_true_values = 'lat_true' in trajectory_df.columns
     
+    # Helper to handle dateline crossing
+    def normalize_longitudes(lons):
+        """If trajectory spans > 180 deg, shift negative lons to positive (>180) to cross Pacific"""
+        if not len(lons): return lons
+        
+        # Check for large jumps
+        lons = np.array(lons)
+        # Simple heuristic: if we have points near 170 and -170, shift negatives
+        has_east = np.any(lons > 150)
+        has_west = np.any(lons < -150)
+        
+        if has_east and has_west:
+            # Shift -180...0 to 180...360
+            lons = np.where(lons < 0, lons + 360, lons)
+            
+        return lons
+
+    # 提取航路点以显示设定航线
+    waypoints_lat = [route['origin_lat']]
+    waypoints_lon = [route['origin_lon']]
+    for i in range(1, 11):
+        lat = route.get(f'waypoint{i}_lat')
+        lon = route.get(f'waypoint{i}_lon')
+        if pd.notna(lat) and pd.notna(lon):
+            waypoints_lat.append(lat)
+            waypoints_lon.append(lon)
+    waypoints_lat.append(route['dest_lat'])
+    waypoints_lon.append(route['dest_lon'])
+    
+    # 统一处理经度跨越
+    # 合并检查所有点 (航路点 + 轨迹点) 以决定是否需要平移
+    all_lons = list(waypoints_lon) + list(trajectory_df['lon'])
+    
+    # 检测跨越
+    lons_array = np.array(all_lons)
+    has_east = np.any(lons_array > 90)
+    has_west = np.any(lons_array < -90)
+    # 更加严格的检测：必须同时有 >150 和 < -150 或者是明显的太平洋航线
+    is_pacific = np.any(lons_array > 160) and np.any(lons_array < -160)
+    
+    adjusted_waypoints_lon = np.array(waypoints_lon)
+    adjusted_traj_lon = trajectory_df['lon'].values.copy()
+    adjusted_true_lon = trajectory_df['lon_true'].values.copy() if has_true_values else None
+    
+    if is_pacific:
+        adjusted_waypoints_lon = np.where(adjusted_waypoints_lon < 0, adjusted_waypoints_lon + 360, adjusted_waypoints_lon)
+        adjusted_traj_lon = np.where(adjusted_traj_lon < 0, adjusted_traj_lon + 360, adjusted_traj_lon)
+        if has_true_values:
+            adjusted_true_lon = np.where(adjusted_true_lon < 0, adjusted_true_lon + 360, adjusted_true_lon)
+
+    # 设定航线 (参考轨迹)
+    fig.add_trace(go.Scattergeo(
+        lon=adjusted_waypoints_lon,
+        lat=waypoints_lat,
+        mode='lines',
+        line=dict(width=2, color='rgba(128, 128, 128, 0.5)', dash='dash'),
+        name='设定航线',
+        hovertemplate='设定航线<extra></extra>'
+    ))
+    
     # 真值轨迹（如果存在）
     if has_true_values:
         fig.add_trace(go.Scattergeo(
-            lon=trajectory_df['lon_true'],
+            lon=adjusted_true_lon,
             lat=trajectory_df['lat_true'],
             mode='lines',
             line=dict(width=2, color='rgba(39, 174, 96, 0.7)', dash='dot'),
@@ -219,7 +279,7 @@ def create_map_figure(trajectory_df, route):
     
     # 带噪声的量测轨迹
     fig.add_trace(go.Scattergeo(
-        lon=trajectory_df['lon'],
+        lon=adjusted_traj_lon,
         lat=trajectory_df['lat'],
         mode='lines+markers',
         line=dict(width=2.5, color='rgba(231, 76, 60, 0.8)' if has_true_values else 'rgba(65, 105, 225, 0.8)'),
@@ -237,7 +297,7 @@ def create_map_figure(trajectory_df, route):
     
     # 起点和终点
     fig.add_trace(go.Scattergeo(
-        lon=[trajectory_df['lon'].iloc[0], trajectory_df['lon'].iloc[-1]],
+        lon=[adjusted_traj_lon[0], adjusted_traj_lon[-1]],
         lat=[trajectory_df['lat'].iloc[0], trajectory_df['lat'].iloc[-1]],
         mode='markers+text',
         marker=dict(size=12, color=['#27ae60', '#e74c3c'], symbol=['circle', 'square']),
@@ -249,8 +309,9 @@ def create_map_figure(trajectory_df, route):
     ))
     
     # 计算地图边界，自动缩放到航线区域 (60% 占比)
+    # 使用调整后的经度计算边界
     lat_min, lat_max = trajectory_df['lat'].min(), trajectory_df['lat'].max()
-    lon_min, lon_max = trajectory_df['lon'].min(), trajectory_df['lon'].max()
+    lon_min, lon_max = adjusted_traj_lon.min(), adjusted_traj_lon.max()
     
     # 计算中心点
     lat_center = (lat_min + lat_max) / 2
@@ -270,17 +331,26 @@ def create_map_figure(trajectory_df, route):
     # 宽度方向：强制为高度的 1.8 倍
     view_width = view_height * 1.8
     
-    fig.update_geos(
+    geo_args = dict(
         projection_type="natural earth",
         showland=True, landcolor='rgb(243, 243, 243)',
         showocean=True, oceancolor='rgb(230, 245, 255)',
         coastlinecolor='rgb(180, 180, 180)',
         showlakes=True, lakecolor='rgb(200, 230, 255)',
-        showcountries=True, countrycolor='rgb(200, 200, 200)',
-        # 设置地图范围
-        lataxis=dict(range=[lat_center - view_height/2, lat_center + view_height/2]),
-        lonaxis=dict(range=[lon_center - view_width/2, lon_center + view_width/2]),
+        showcountries=True, countrycolor='rgb(200, 200, 200)'
     )
+    
+    if is_pacific:
+        # 太平洋航线使用手动范围和旋转
+        geo_args['lataxis'] = dict(range=[lat_center - view_height/2, lat_center + view_height/2])
+        geo_args['lonaxis'] = dict(range=[lon_center - view_width/2, lon_center + view_width/2])
+        geo_args['projection_rotation'] = dict(lon=180)
+    else:
+        # 普通航线使用自动缩放
+        # 注意: Plotly fitbounds 可能有时不完美，但比手动计算更稳健
+        geo_args['fitbounds'] = 'locations'
+        
+    fig.update_geos(**geo_args)
     
     fig.update_layout(
         title=dict(
@@ -859,9 +929,14 @@ def run_simulation(route_name: str, aircraft_type: str, cruise_mach: float, crui
     # 创建噪声配置
     noise_config = None
     if wind_noise > 0 or aero_pert > 0 or imu_noise > 0 or gps_noise > 0:
+        # 将物理单位转换为归一化值 [0, 1]
+        # 风场: [0, 20] m/s -> [0, 1]
+        # 气动摄动: [0, 0.3] -> [0, 1] (但直接使用物理值,因为NoiseConfig中它就是比例系数)
+        wind_intensity_normalized = wind_noise / 20.0  # 映射到 [0, 1]
+        
         noise_config = NoiseConfig(
-            wind_intensity=wind_noise,
-            aero_perturbation=aero_pert,
+            wind_intensity=wind_intensity_normalized,
+            aero_perturbation=aero_pert,  # 直接使用物理值
             imu_noise=imu_noise,
             imu_noise_type=imu_type,
             imu_flicker_prob=imu_flicker_prob,
@@ -1027,14 +1102,14 @@ with demo:
                     gr.Markdown("**🌪️ 环境扰动**")
                     with gr.Row():
                         wind_noise_slider = gr.Slider(
-                            minimum=0.0, maximum=1.0, value=0.0, step=0.05,
-                            label="风场湍流强度",
-                            info="Dryden模型 σ: 0.5~6 m/s"
+                            minimum=0.0, maximum=20.0, value=0.0, step=0.5,
+                            label="风场湍流强度 (m/s)",
+                            info="Dryden模型风速标准差, 轻度\~1, 中度\~3, 重度\~6, 极端\~20"
                         )
                         aero_pert_slider = gr.Slider(
-                            minimum=0.0, maximum=1.0, value=0.0, step=0.05,
+                            minimum=0.0, maximum=0.3, value=0.0, step=0.01,
                             label="气动摄动强度",
-                            info="湍流引起的气动力扰动 0~5%"
+                            info="湍流引起的气动力扰动, 建议≤0.1"
                         )
                     
                     gr.Markdown("**📁 导出设置**")

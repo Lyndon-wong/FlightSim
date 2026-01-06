@@ -69,3 +69,7 @@ venv.bak/
 
 # Gradio cache
 flagged/
+
+# User requested explicit rules
+*.pyc
+__pycache__

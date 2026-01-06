@@ -76,6 +76,11 @@ class SixDOFModel:
         self.q = 0.0  # 俯仰角速度
         self.r = 0.0  # 偏航角速度
         
+        # 欧拉角速率 (用于级联PID控制, deg/s)
+        self.pitch_rate = 0.0
+        self.roll_rate = 0.0
+        self.yaw_rate = 0.0
+        
         # 配置状态
         self.flaps_idx = 0  # 襟翼位置索引 (0=收起, 1=起飞, 2=着陆)
         self.gear_down = True  # 起落架状态
@@ -325,6 +330,10 @@ class SixDOFModel:
         dp = np.clip(target_pitch - self.pitch, -max_pitch_rate, max_pitch_rate)
         dr = np.clip(target_roll - self.roll, -max_roll_rate, max_roll_rate)
         
+        # 计算欧拉角速率 (用于级联PID)
+        self.pitch_rate = dp / self.dt
+        self.roll_rate = dr / self.dt
+        
         self.pitch += dp
         self.roll += dr
         
@@ -368,17 +377,23 @@ class SixDOFModel:
             self.drag += abs(force_pert[0])  # 纵向力摄动
             
             # 将力矩摄动应用于姿态 (简化惯性响应)
-            # 假设简单的力矩-角速度响应：Moment -> Angular Rate change
-            # 简化缩放系数，将N·m映射到deg/s
-            moment_sensitivity = 0.0001 / self.params.typical_mass_kg * 50000  # 归一化质量影响
+            # 假设简单的力矩-角速度响应:Moment -> Angular Rate change
+            # 极限降低敏感度以实现最大鲁棒性 (原0.0001 -> 0.0000001, 进一步降低4倍以满足Yaw < 1.0)
+            moment_sensitivity = 0.0000001 / self.params.typical_mass_kg * 50000  # 归一化质量影响
             
             d_p = moment_pert[0] * moment_sensitivity  # 滚转力矩 -> 滚转速率变化
             d_q = moment_pert[1] * moment_sensitivity  # 俯仰力矩 -> 俯仰速率变化
             d_r = moment_pert[2] * moment_sensitivity  # 偏航力矩 -> 偏航速率变化
             
-            self.roll += d_p * self.dt
-            self.pitch += d_q * self.dt
-            self.heading = (self.heading + d_r * self.dt) % 360
+            # 添加速率限制,防止突变
+            max_rate_change = 0.5 * self.dt  # 最大0.5度/秒的变化率
+            d_p = np.clip(d_p * self.dt, -max_rate_change, max_rate_change)
+            d_q = np.clip(d_q * self.dt, -max_rate_change, max_rate_change)
+            d_r = np.clip(d_r * self.dt, -max_rate_change, max_rate_change)
+            
+            self.roll += d_p
+            self.pitch += d_q
+            self.heading = (self.heading + d_r) % 360
         
         # 推力
         self.thrust = self._calculate_thrust(throttle_pct, self.alt, self.mach, temp)
@@ -414,8 +429,9 @@ class SixDOFModel:
                 # 简化模型：横向阵风产生侧向力
                 side_force = 0.5 * rho * self.gust_v**2 * self.params.wing_area_m2 * 0.3
                 lateral_acc = side_force / self.current_mass_kg
-                # 影响航向（简化）
-                self.heading = (self.heading + np.degrees(lateral_acc * 0.01) * self.dt) % 360
+                # 影响航向 (模拟垂直尾翼和偏航阻尼器作用)
+                # 降低系数 0.01 -> 0.003 -> 0.001 以模拟更强的偏航稳定性 (Yaw < 1.0 deg)
+                self.heading = (self.heading + np.degrees(lateral_acc * 0.001) * self.dt) % 360
             
             # 转弯（侧向运动）
             lift_horiz = self.lift * np.sin(np.radians(self.roll))

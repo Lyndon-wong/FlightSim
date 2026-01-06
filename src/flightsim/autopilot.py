@@ -86,6 +86,7 @@ class StandardAutopilot(BaseAutopilot):
         # 航路点
         self.waypoints: List[Tuple[float, float]] = []
         self.current_wp_idx = 0
+        self.prev_wp: Optional[Tuple[float, float]] = None  # 上一个航路点（用于计算航路段）
         
         # 目标参数
         self.target_alt = 0  # 目标高度（米）
@@ -126,6 +127,14 @@ class StandardAutopilot(BaseAutopilot):
         
         # 控制参数（基于航线占比）- 子类可覆盖
         self._init_tuning_params()
+        
+        # 积分误差状态
+        self.alt_error_integral = 0.0
+        self.spd_error_integral = 0.0
+        
+        # 姿态指令平滑 (用于抑制气动摄动引起的振荡)
+        self.prev_pitch_cmd = 0.0
+        self.prev_roll_cmd = 0.0
     
     def _init_tuning_params(self):
         """
@@ -142,7 +151,7 @@ class StandardAutopilot(BaseAutopilot):
         self.descent_rate_gain = 0.30 # 下降率增益
         self.max_climb_vs = 12.0      # 最大爬升率 m/s
         self.max_descent_vs = 15.0    # 最大下降率 m/s
-        self.roll_gain = 1.5          # 滚转增益
+        self.roll_gain = 1.5          # 滚转增益 (恢复)
         self.max_roll = 30.0          # 最大滚转角
         
         # 进近阶段专用参数
@@ -152,6 +161,22 @@ class StandardAutopilot(BaseAutopilot):
         self.speed_decel_rate = 1.2       # 减速率（m/s per 2sec）
         self.approach_speed_factor = 1.25 # 进近速度系数（相对于着陆速度）
         self.final_speed_factor = 1.05    # 五边速度系数
+        
+        # 鲁棒控制参数
+        self.xte_gain = 2.0               # 航迹偏差增益 (deg/m)
+        self.intercept_angle_max = 45.0   # 最大切入角 (deg)
+        self.ki_alt = 0.02                # 高度积分增益
+        self.ki_spd = 0.005               # 速度积分增益
+        self.max_integral_alt = 5.0       # 高度积分限幅 (对应垂直速度 m/s)
+        self.max_integral_spd = 0.1       # 速度积分限幅 (对应油门百分比)
+        
+        # 级联PID参数 (姿态控制)
+        # 外环: 姿态角误差 -> 期望角速率
+        self.kp_pitch_outer = 1.5         # 俯仰角外环增益
+        self.kp_roll_outer = 2.0          # 滚转角外环增益
+        # 内环: 角速率误差 -> 控制指令
+        self.kp_pitch_rate = 0.5          # 俯仰角速率增益 (增加阻尼)
+        self.kp_roll_rate = 0.4           # 滚转角速率增益 (增加阻尼)
         
     def load_route(self, waypoints: List[Tuple[float, float]], 
                    departure_alt: float = 10.0,
@@ -166,6 +191,7 @@ class StandardAutopilot(BaseAutopilot):
         """
         self.waypoints = waypoints
         self.current_wp_idx = 0
+        self.prev_wp = None
         
         if len(waypoints) >= 2:
             self.departure_airport = waypoints[0]
@@ -358,13 +384,24 @@ class StandardAutopilot(BaseAutopilot):
                 self.phase = FlightPhase.CRUISE
                 
         elif self.phase == FlightPhase.CRUISE:
-            # 基于进度：到达下降点
-            if progress_ratio >= self.descent_distance_ratio:
+            # Smart Descent Trigger (Distance Based)
+            # Calculate distance needed for 3 deg descent + buffer
+            # Tan(3) ~ 0.0524. Ratio ~ 19.
+            descent_gradient = 3.0
+            alt_diff = self.cruise_alt_m - self.pattern_alt_m
+            if alt_diff > 0:
+                descent_dist_needed = alt_diff / np.tan(np.radians(descent_gradient)) 
+                descent_dist_needed += 40000.0 # 40km Buffer to ensure we reach capture altitude
+            else:
+                descent_dist_needed = 40000.0
+            
+            if dist_to_dest_2d < descent_dist_needed:
                 self.phase = FlightPhase.DESCENT
                 
         elif self.phase == FlightPhase.DESCENT:
-            # 基于进度：到达进近距离比例
-            if progress_ratio >= self.approach_distance_ratio:
+            # Smart Approach Trigger
+            # Trigger when close to pattern area (e.g. 40km)
+            if dist_to_dest_2d < 40000:
                 self.phase = FlightPhase.APPROACH_DESCENT
                 
         elif self.phase == FlightPhase.APPROACH_DESCENT:
@@ -477,23 +514,17 @@ class StandardAutopilot(BaseAutopilot):
         progress_ratio = dist_flown / self.total_route_distance if self.total_route_distance > 0 else 0
         progress_ratio = np.clip(progress_ratio, 0.0, 1.0)
         
-        # 下降阶段占比范围: descent_distance_ratio -> approach_distance_ratio
-        # 例如: 0.80 -> 0.95 (即 80%-95% 这15%的航程用于下降)
-        descent_start_ratio = self.descent_distance_ratio
-        descent_end_ratio = self.approach_distance_ratio
+        # 几何下降逻辑: 保持 3.0 度下滑道指向五边高度
+        # Target Alt = Dist * tan(3.0) + Pattern Alt
+        # 这确保了无论何时触发，都遵循物理下降路径
+        descent_gradient = 3.0
         
-        # 计算下降进度 (0.0 到 1.0)
-        if progress_ratio <= descent_start_ratio:
-            descent_progress = 0.0
-        elif progress_ratio >= descent_end_ratio:
-            descent_progress = 1.0
-        else:
-            descent_progress = (progress_ratio - descent_start_ratio) / (descent_end_ratio - descent_start_ratio)
+        # 计算到目的地的几何路径高度
+        dist_to_dest = self.total_route_distance - dist_flown
+        geometric_alt = dist_to_dest * np.tan(np.radians(descent_gradient)) + self.pattern_alt_m
         
-        # 线性插值计算目标高度: 从巡航高度下降到五边高度
-        self.target_alt = self.cruise_alt_m - \
-                         (self.cruise_alt_m - self.pattern_alt_m) * descent_progress
-        self.target_alt = max(self.pattern_alt_m, self.target_alt)
+        # 限制目标高度不超过巡航高度，不低于五边高度
+        self.target_alt = np.clip(geometric_alt, self.pattern_alt_m, self.cruise_alt_m)
         
         # 速度控制：下降时适度减速
         self.target_speed = self.cruise_speed_ms * 0.8
@@ -706,15 +737,28 @@ class StandardAutopilot(BaseAutopilot):
         alt_err = self.target_alt - state['alt']
         
         # 根据高度误差计算目标垂直速度
+        # 降低P增益以减少气动摄动引起的振荡 (0.3/0.4 -> 0.15/0.2)
         if alt_err > 0:  # 需要爬升
-            desired_vs = np.clip(alt_err * 0.15, 0.0, 12.0)  # 限制最大爬升率12m/s
+            desired_vs = np.clip(alt_err * 0.15, 0.0, 12.0)  # P增益 0.3 -> 0.15
         else:  # 需要下降
             # FINAL阶段极其aggressive的下降
             if self.phase == FlightPhase.FINAL:
                 # 进一步提高下降增益和下降率限制
-                desired_vs = np.clip(alt_err * 0.5, -25.0, 0.0)  # 最大下降率25m/s
+                desired_vs = np.clip(alt_err * 0.5, -25.0, 0.0)
             else:
-                desired_vs = np.clip(alt_err * 0.3, -15.0, 0.0)  # 最大下降率15m/s
+                desired_vs = np.clip(alt_err * 0.2, -15.0, 0.0) # P增益 0.4 -> 0.2
+        
+        # 积分项 (消除稳态误差)
+        if abs(alt_err) < 50: # 仅在误差较小时积分，防止过大的积分饱和
+            self.alt_error_integral += alt_err * 0.1  # 简化dt处理
+            # 增加积分限幅和增益
+            self.ki_alt = 0.1  # 0.02 -> 0.1
+            self.max_integral_alt = 8.0 # 5.0 -> 8.0
+            
+            self.alt_error_integral = np.clip(
+                self.alt_error_integral, -self.max_integral_alt/self.ki_alt, self.max_integral_alt/self.ki_alt
+            )
+            desired_vs += self.alt_error_integral * self.ki_alt
         
         # 速度控制 - 根据阶段动态调整
         spd_err = self.target_speed - state['tas']
@@ -732,7 +776,17 @@ class StandardAutopilot(BaseAutopilot):
         else:
             speed_gain = 0.01  # 正常增益
         
-        throttle = np.clip(0.7 + spd_err * speed_gain, 0.0, 1.0)
+        # 速度积分项
+        if abs(spd_err) < 10:
+            self.spd_error_integral += spd_err * 0.1
+            self.spd_error_integral = np.clip(
+                self.spd_error_integral, -self.max_integral_spd/self.ki_spd, self.max_integral_spd/self.ki_spd
+            )
+        else:
+            self.spd_error_integral = 0.0 # 误差过大时重置积分
+            
+        throttle_cmd = 0.7 + spd_err * speed_gain + self.spd_error_integral * self.ki_spd
+        throttle = np.clip(throttle_cmd, 0.0, 1.0)
         
         # 俯仰/航迹角控制 - 使用目标航迹角而非直接控制俯仰
         current_vs = state['speed_v']
@@ -749,10 +803,11 @@ class StandardAutopilot(BaseAutopilot):
         
         # PD控制：比例 + 微分阻尼
         # FINAL阶段使用更高的增益以快速下降
+        # 降低增益以减少气动摄动引起的振荡 (0.4/0.6 -> 0.2/0.4)
         if self.phase == FlightPhase.FINAL:
-            gamma_cmd = current_gamma_deg + gamma_err * 0.6  # 提高增益
+            gamma_cmd = current_gamma_deg + gamma_err * 0.4  # 降低增益
         else:
-            gamma_cmd = current_gamma_deg + gamma_err * 0.4
+            gamma_cmd = current_gamma_deg + gamma_err * 0.2  # 降低增益
         gamma_cmd = np.clip(gamma_cmd, -10.0, 12.0)  # 扩大下降角度范围
         
         # 俯仰角 = 航迹角 + 期望攻角
@@ -789,16 +844,102 @@ class StandardAutopilot(BaseAutopilot):
             # 航路点切换（10km）
             if dist_to_wp < 10000:
                 self.current_wp_idx += 1
+                self.prev_wp = target_wp  # 更新上一航路点
         
-        # 滚转控制
+        # 自动驾驶横向控制（使用XTE修正）
+        # 如果有明确的航路段（prev_wp -> target_wp），使用XTE
+        # 否则回退到直接指向（Homing）
+        if self.current_wp_idx < len(self.waypoints) and self.prev_wp is not None:
+            target_wp = self.waypoints[self.current_wp_idx]
+            self.target_heading = self._calculate_lateral_control(
+                state['lat'], state['lon'],
+                self.prev_wp, target_wp
+            )
+        # 级联PID滚转控制
+        # 外环: 航向误差 -> 期望滚转角
         hdg_err = self.target_heading - state['heading']
         if hdg_err > 180:
             hdg_err -= 360
         if hdg_err < -180:
             hdg_err += 360
-        roll = np.clip(hdg_err * self.roll_gain, -self.max_roll, self.max_roll)
+        desired_roll = np.clip(hdg_err * self.roll_gain, -self.max_roll, self.max_roll)
         
-        return throttle, pitch, roll
+        # 中环: 滚转角误差 -> 期望滚转角速率
+        roll_error = desired_roll - state['roll']
+        desired_roll_rate = roll_error * self.kp_roll_outer
+        desired_roll_rate = np.clip(desired_roll_rate, -15.0, 15.0)  # 限制角速率
+        
+        # 内环: 滚转角速率误差 -> 滚转指令
+        roll_rate_error = desired_roll_rate - state.get('roll_rate', 0.0)
+        roll = roll_rate_error * self.kp_roll_rate
+        roll = np.clip(roll, -self.max_roll, self.max_roll)
+        
+        # 级联PID俯仰控制
+        # 外环: 俯仰角误差 -> 期望俯仰角速率
+        pitch_error = pitch - state['pitch']
+        desired_pitch_rate = pitch_error * self.kp_pitch_outer
+        desired_pitch_rate = np.clip(desired_pitch_rate, -10.0, 10.0)  # 限制角速率
+        
+        # 内环: 俯仰角速率误差 -> 俯仰指令 (作为增量)
+        pitch_rate_error = desired_pitch_rate - state.get('pitch_rate', 0.0)
+        pitch_increment = pitch_rate_error * self.kp_pitch_rate
+        # 限制单步增量，防止过激响应 (例如最大改变 2度)
+        pitch_increment = np.clip(pitch_increment, -2.0, 2.0)
+        
+        final_pitch_cmd = state['pitch'] + pitch_increment
+        final_pitch_cmd = np.clip(final_pitch_cmd, -25.0, 20.0) # 绝对俯仰限制
+        
+        # 处理滚转指令 (同样作为增量)
+        final_roll_cmd = state['roll'] + roll
+        final_roll_cmd = np.clip(final_roll_cmd, -self.max_roll, self.max_roll)
+        
+        return throttle, final_pitch_cmd, final_roll_cmd
+        
+    def _calculate_lateral_control(self, lat: float, lon: float, 
+                                 wp_start: Tuple[float, float], 
+                                 wp_end: Tuple[float, float]) -> float:
+        """
+        计算横向控制（带XTE修正）
+        
+        Args:
+            lat, lon: 当前位置
+            wp_start: 航路段起点
+            wp_end: 航路段终点
+            
+        Returns:
+            目标航向（度）
+        """
+        # 1. 计算航路段航向 (Path Bearing)
+        path_bearing = NavUtils.calculate_bearing(
+            wp_start[0], wp_start[1],
+            wp_end[0], wp_end[1]
+        )
+        
+        # 2. 计算偏航距离 (Cross-Track Error, XTE)
+        # 正值表示在航线右侧，负值在左侧
+        # 简化计算：XTE = dist * sin(bearing_to_point - path_bearing)
+        dist_to_start = NavUtils.haversine_distance(
+            wp_start[0], wp_start[1], lat, lon
+        )
+        bear_to_point = NavUtils.calculate_bearing(
+            wp_start[0], wp_start[1], lat, lon
+        )
+        
+        bear_diff = bear_to_point - path_bearing
+        # 标准化到 -180 ~ 180
+        if bear_diff > 180: bear_diff -= 360
+        if bear_diff < -180: bear_diff += 360
+            
+        # XTE (m)
+        xte = dist_to_start * np.sin(np.radians(bear_diff))
+        
+        # 3. 计算切入航向修正
+        # 在航线右侧(XTE>0) -> 需要向左修正(减小航向) -> correction为负
+        correction = - np.clip(xte * 0.05, -self.intercept_angle_max, self.intercept_angle_max)
+        
+        target_heading = path_bearing + correction
+        
+        return target_heading % 360
 
 
 class ShortHaulAutopilot(StandardAutopilot):
@@ -823,10 +964,9 @@ class ShortHaulAutopilot(StandardAutopilot):
         # 更高的爬升/下降率
         self.climb_rate_gain = 0.20
         self.descent_rate_gain = 0.40
-        self.max_climb_vs = 15.0
         self.max_descent_vs = 18.0
         self.roll_gain = 2.0
-        self.max_roll = 35.0
+        self.max_roll = 25.0
         
         # 短程机进近参数 - 较陡的下滑道，快速减速
         self.glide_slope_angle = 3.5          # 稍陡的下滑道
@@ -835,6 +975,20 @@ class ShortHaulAutopilot(StandardAutopilot):
         self.speed_decel_rate = 1.8           # 快速减速
         self.approach_speed_factor = 1.20
         self.final_speed_factor = 1.03
+        
+        # 鲁棒控制参数 (继承自父类，但需要显式定义因为覆盖了方法)
+        self.xte_gain = 2.5               # 短程机响应更快
+        self.intercept_angle_max = 45.0
+        self.ki_alt = 0.01                # 极低积分增益，消除Phugoid
+        self.ki_spd = 0.008
+        self.max_integral_alt = 8.0
+        self.max_integral_spd = 0.15
+        
+        # 级联PID参数 (短程机响应更快)
+        self.kp_pitch_outer = 1.8
+        self.kp_roll_outer = 2.5
+        self.kp_pitch_rate = 0.8          # 强阻尼
+        self.kp_roll_rate = 0.4
 
 
 class MediumHaulAutopilot(StandardAutopilot):
@@ -862,7 +1016,7 @@ class MediumHaulAutopilot(StandardAutopilot):
         self.max_climb_vs = 12.0
         self.max_descent_vs = 15.0
         self.roll_gain = 1.5
-        self.max_roll = 30.0
+        self.max_roll = 22.0
         
         # 中程机进近参数 - 标准配置
         self.glide_slope_angle = 3.0
@@ -871,6 +1025,20 @@ class MediumHaulAutopilot(StandardAutopilot):
         self.speed_decel_rate = 1.2
         self.approach_speed_factor = 1.25
         self.final_speed_factor = 1.05
+        
+        # 鲁棒控制参数
+        self.xte_gain = 0.5
+        self.intercept_angle_max = 45.0
+        self.ki_alt = 0.01
+        self.ki_spd = 0.005
+        self.max_integral_alt = 8.0
+        self.max_integral_spd = 0.1
+        
+        # 级联PID参数 (中程机标准配置)
+        self.kp_pitch_outer = 1.5
+        self.kp_roll_outer = 2.0
+        self.kp_pitch_rate = 0.8
+        self.kp_roll_rate = 0.4
 
 
 class LongHaulAutopilot(StandardAutopilot):
@@ -898,7 +1066,7 @@ class LongHaulAutopilot(StandardAutopilot):
         self.max_climb_vs = 10.0
         self.max_descent_vs = 25.0           # 大幅增加允许的下降率，确保可以追赶下滑道
         self.roll_gain = 1.2
-        self.max_roll = 25.0
+        self.max_roll = 20.0
         
         # 长程机进近参数 - 较缓的下滑道，平稳减速
         self.glide_slope_angle = 2.8          # 较缓的下滑道
@@ -907,6 +1075,20 @@ class LongHaulAutopilot(StandardAutopilot):
         self.speed_decel_rate = 1.0           # 增加减速率以适应高能进近
         self.approach_speed_factor = 1.30
         self.final_speed_factor = 1.08
+        
+        # 鲁棒控制参数 (长程机更温和)
+        self.xte_gain = 1.5               # 较温和的修正
+        self.intercept_angle_max = 30.0   # 限制切入角
+        self.ki_alt = 0.01                # 极低积分增益
+        self.ki_spd = 0.003
+        self.max_integral_alt = 6.0
+        self.max_integral_spd = 0.08
+        
+        # 级联PID参数 (长程机更平稳)
+        self.kp_pitch_outer = 1.2
+        self.kp_roll_outer = 1.5
+        self.kp_pitch_rate = 0.8          # 强阻尼
+        self.kp_roll_rate = 0.35          # 长程机稍微增加
 
     def _control_final(self) -> Tuple[float, float, float]:
         """
