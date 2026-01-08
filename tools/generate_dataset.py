@@ -78,7 +78,7 @@ OUTPUT_DIR_ROOT = "/home/b220/share2/dataset/flightsim/v1"
 
 # 6. 并行设置
 # 使用的CPU核心数 (None表示使用所有可用核心)
-NUM_CORES = 20 
+NUM_CORES = 12
 
 # ============================================================================
 # 脚本逻辑 (Script Logic)

@@ -65,7 +65,7 @@ venv.bak/
 
 # User requested explicitly ignored directories
 # Anchor to root to avoid ignoring src/flightsim/data
-/data/
+/data
 /generate_test/
 
 # Allow tracking of source data files
